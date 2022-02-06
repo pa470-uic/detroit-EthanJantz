@@ -10,31 +10,150 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(cmfproperty)
 library(tidyverse)
 library(lubridate)
+
+options(scipen = 999)
+
+`%nin%` <- Negate(`%in%`)
 
 ```
 
 Template file. Code will be included in folded blocks in the output to facilitate grading. Please knit this file and commit both the rmd and the html output. If you add external files to your analysis, please commit them to the files folder in this repository. NOTE: please do not commit large (15MB+) files to GitHub. Instead please denote the origin of the files in your code. 
 
-```{r}
-#example connection to database. note that you have to download the database from onedrive
+```{r data}
+con <- DBI::dbConnect(RSQLite::SQLite(), here::here("database", "detroit.sqlite"))
 
-con <- DBI::dbConnect(RSQLite::SQLite(), "database/detroit.sqlite")
+# DBI::dbListTables(con) # assessments, blight, foreclosures, parcels, parcels_historic, sales
 
-# sales tbl
+sales <- tbl(con, 'sales') %>% collect()
 
-dplyr::tbl(con, 'sales')
+assessments <- tbl(con, 'assessments') %>% collect()
 
-# convert to tibble
-#dplyr::tbl(con, 'sales') %>% dplyr::collect()
+blight <- tbl(con, 'blight') %>% collect()
 
-# sql query
+foreclosures <- tbl(con, 'foreclosures') %>% collect()
 
-dplyr::tbl(con, 'sales') %>% count(year(sale_date))
+parcels <- tbl(con, 'parcels') %>% collect()
 
-#dplyr::tbl(con, 'sales') %>% count(year(sale_date)) %>% show_query()
-
+parcels_historic <- tbl(con, 'parcels_historic') %>% collect()
 ```
 
 
+## Section A
+
+Conduct an exploratory data analysis of homes in Detroit. Offer an overview of relevant trends in the data and data quality issues. Contextualize your analysis with key literature on properties in Detroit.
+
+There are several data sets within the database provided: `r DBI::dbListTables(con)`
+
+### Parcels and Historic Parcels
+
+```{r eda parcels}
+parcels_clean <- parcels %>%
+  mutate(
+    across(c(parcel_number, related), ~str_remove(.x, "\\.$")),
+    sale_date = as_datetime(sale_date)
+    )
+
+# sum(parcels_historic$PARCELNO %in% parcels_clean$parcel_number) # 377,497 
+
+# unshared_parcels <- parcels_historic %>%
+#   filter(PARCELNO %nin% parcels_clean$parcel_number) %>%
+#   pull(PARCELNO)
+
+# Fleshing out whether each of the unshared has a partial match
+# tictoc::tic()
+# map_lgl(
+#   unshared_parcels[1:100], 
+#   ~ any(str_detect(parcels$parcel_number, str_extract(.x, "[0-9]*")))
+#   # filter(str_extract(.x, "[0-9]*") %>% 
+#     #          str_detect(parcel_number, .)) %>%
+#     # mutate(
+#     #   partial_parcel = .x, 
+#     #   partial_match = str_extract(.x, "[0-9]*")
+#     # )
+# ) # %>% sum() # 49 / 100 parcels are partial matches within the parcels data
+# tictoc::toc() # 10.64 seconds * 100 = 17.73 minutes, let's take this sample as a guess and assume that half of the unshared parcels have some match with the full data that we're missing
+```
+
+Of the `r nrow(parcels_historic)` historic parcels, `r sum(parcels_historic$PARCELNO %in% parcels_clean$parcel_number)` are found within the current parcels. The remaining `r nrow(parcels_historic) - sum(parcels_historic$PARCELNO %in% parcels_clean$parcel_number)` parcels in the historic data set make up a small portion of the total data. This is fixable, as you can see in the commented code above there are partial matches for about half of them based on my sampling method, but is not time efficient to match. If necessary I'll come back to this later. 
+
+```{r eda parcels 2}
+# Ward share
+parcels_clean %>%
+  count(ward, name = "parcels") %>%
+  filter(ward != " ") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Property class
+parcels_clean %>%
+  count(property_class_desc, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Vacancy
+parcels_clean %>%
+  mutate(vacant = str_detect(property_class_desc, "VACANT")) %>%
+  count(vacant, name = "parcels") %>%
+  drop_na() %>%
+  mutate(prop = scales::percent(parcels / sum(parcels)))
+
+# Improvements
+parcels_clean %>%
+  count(is_improved, name = "parcels") %>%
+  drop_na() %>%
+  mutate(prop = scales::percent(parcels / sum(parcels)))
+
+# Style
+parcels_clean %>%
+  count(style, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Missing style values
+parcels_clean %>%
+  filter(is.na(style)) %>%
+  mutate(vacant = str_detect(property_class_desc, "VACANT")) %>%
+  count(vacant, name = "parcels")
+
+# Tax status
+parcels_clean %>%
+  count(tax_status, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Number of buildings on parcel
+parcels_clean %>%
+  mutate(num_bldgs = ifelse(num_bldgs %in% c(0, 1), num_bldgs, 2)) %>%
+  count(num_bldgs, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop)) 
+```
+
+More than 50% of parcels are found within the 22nd, 21st, and 16th wards. The overwhelming majority of parcels are residential, and about 35% of all parcels are vacant. 62% of parcels have been improved. 50% of parcels are designated as single-family homes, and almost 40% of parcels have no "style" designation (likely because they're considered vacant). 70% of properties are taxable, and 21% are part of the city land bank. The city itself owns 2.1%, or 8,137 parcels. 60% of parcels contain one building, 37% contain zero buildings, and 1% of parcels contain 2 or more buildings. 
+
+```{r eda parcels 3}
+# Year of last sale
+parcels_clean %>%
+  mutate(sale_year = lubridate::floor_date(sale_date, unit = "year")) %>%
+  # drop_na(sale_year) %>%
+  count(sale_year, name = "parcels_sold") %>%
+  arrange(desc(parcels_sold))
+
+```
+
+Most sales in the parcels data happened around the Great Financial Crisis of 2008. We can explore how much of that sales acivity was foreclosures in a later part of this section. There are `r is.na(parcels_clean$sale_date) %>% sum()` parcels that have no sale date and `r (parcels_clean$sale_price == 0) %>% sum()` parcels that either did not sell or for some other reason sold for $0. 
+
+## Section B
+
+Use cmfproperty to conduct a sales ratio study across the relevant time period. Note that cmfproperty is designed to produce Rmarkdown reports but use the documentation and insert relevant graphs/figures into your report. Look to make this reproducible since you’ll need these methods to analyze your assessment model later on. Detroit has many sales which are not arm’s length (sold at fair market value) so some sales should be excluded, but which ones?
+
+## Section C 
+
+Explore trends and relationships with property sales using simple regressions
+
+## Section D
+
+Explore trends and relationships with foreclosures using simple regressions
