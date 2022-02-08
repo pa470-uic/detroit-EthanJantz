@@ -49,6 +49,8 @@ There are several data sets within the database provided: `r DBI::dbListTables(c
 
 ### Parcels and Historic Parcels
 
+Note: `parcel_number` is present across all data, and they all have trailing periods that seem out of place (except for the historic parcel data). I'm cleaning those out of the data and making transformations to benefit the ease of analysis and use as I go. If these periods are important please provide feedback to let me know!
+
 ```{r eda parcels}
 parcels_clean <- parcels %>%
   mutate(
@@ -145,6 +147,86 @@ parcels_clean %>%
 ```
 
 Most sales in the parcels data happened around the Great Financial Crisis of 2008. We can explore how much of that sales acivity was foreclosures in a later part of this section. There are `r is.na(parcels_clean$sale_date) %>% sum()` parcels that have no sale date and `r (parcels_clean$sale_price == 0) %>% sum()` parcels that either did not sell or for some other reason sold for $0. 
+
+Is there some overlap between foreclosures, sales, and the information in the parcel data? 
+
+### Foreclosures
+
+```{r eda foreclosures}
+foreclosures_clean <- foreclosures %>%
+  mutate(prop_parcelnum = str_remove(prop_parcelnum, "\\.$"))
+
+foreclosures_clean %>%
+  filter(prop_parcelnum %in% parcels_clean$parcel_number)
+
+foreclosures_sum <- foreclosures_clean %>%
+  mutate(
+    across(where(is.numeric), ~ifelse(is.na(.x), 0, .x)),
+    foreclosures = rowSums(across(where(is.numeric)))
+    ) %>%
+  select(where(is.character), foreclosures)
+
+foreclosures_sum %>%
+  count(foreclosures) %>%
+  mutate(prop = n / sum(n))
+```
+
+`r foreclosures$prop_parcelnum %in% parcels$parcel_number %>% sum()` parcels in the foreclosure data are found within the parcel data, meaning that approximately 35% of parcels have been foreclosed on. Approximately 20% of the parcels in the foreclosure data has had more than one foreclosure since 2003. By joining this data with parcel data we can explore the spatial statistics of foreclosure in Detroit, but that isn't the focus of this project for now. 
+
+### Sales 
+
+To understand sales data it is important to understand terms. A grantor is the seller of the property and the grantee is the buyer. `ecf` stands for ["Economic Condition Factor"](https://www.michigan.gov/documents/treasury/Development_of_ECF_for_Public_Use_7-13_456527_7.pdf), which in Michigan is a state-based tool to adjust the assessment of the property to the local market. This variable seems important, as we can use it to identify qualitative aspects of sales, like whether it was a validated arms-length sale.
+
+```{r eda sales}
+sales_clean <- sales %>%
+  mutate(
+    across(c(grantor, grantee, sale_terms, ecf, property_c), as.factor),
+    sale_date = lubridate::as_date(sale_date),
+    maybe_not_armslength = ifelse(sale_price == 0, 1, 0) %>% as.logical()
+  )
+
+sales_clean %>%
+  count(maybe_not_armslength) %>%
+  mutate(prop = n / sum(n))
+
+sales_clean %>%
+  mutate(sale_year = lubridate::floor_date(sale_date, unit = "year")) %>%
+  # drop_na(sale_year) %>%
+  count(sale_year, name = "parcels_sold") %>%
+  ggplot(aes(x = sale_year, y = parcels_sold)) +
+  geom_col()
+
+sales_clean %>%
+  count(grantor) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+
+sales_clean %>%
+  count(grantee) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+
+sales_clean %>%
+  count(sale_terms) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+```
+
+There's one imputed variable here: `maybe_not_armslength`, and it indicates a sale that I suspect wasn't an ["arms length"](https://www.investopedia.com/terms/a/armslength.asp) sale, or a property where the buyer and seller weren't approaching the sale in a way where both were aiming to get the best price for the property. One example of this would be an older adult selling the family home to a child for $0. For now I'm taking a crude approach and classifying only sales where the price was 0 as suspected non-arms length sales, but that will become a formula of some sort when it comes time to build a model.
+
+The earliest sale in the sales data is from 2011 and the latest is from November 2020. We can likely pad this out with some data from the historical parcel data if historic sale data helps the model. The most sales happened in 2014, and the fewest happened in 2011 if we don't count 2020. It looks like the pandemic had a big effect on home sales in 2020 Detroit.
+
+The Wayne County Treasurer (11%) and Detroit Land Bank Authority (9%) were the most prevalent sellers of real estate in the sales data, with Fannie Mae coming in fourth behind the county sheriff. Yikes. The largest private grantor was Bank of America. Banks and LLCs make up a large portion of the sales data but we can see a number of individuals listed.
+
+The most prevalent buyer of real estate was the Detroit land Bank Authority (4%). It's worth noting that only public entities purchased more than 1% of all real estate sold in the data, with Hantz Woodlands LLC being the 6th largest purchaser of land at .05%. Hantz Woodlands LLC is an urban tree farm.
+
+35% of sales had no economic consideration. Almost 20% were exempt/government purchases. 16% of sales were validated as arms length sales. This isn't as many as I hoped, but we can ensure they are put in the training data. 
+
+Property class definitions can be found [here](https://miproptaxlaw.com/wp-content/uploads/2018/04/STCRecommendedClassificationCodes.pdf). This is already captured in the parcels data. It's not likely that changes in property classification are prevalent, but it may be worth looking into.
+
+### Blight
+
+### Assessments
 
 ## Section B
 
