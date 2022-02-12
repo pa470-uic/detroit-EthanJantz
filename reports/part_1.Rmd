@@ -17,12 +17,12 @@ library(lubridate)
 options(scipen = 999)
 
 `%nin%` <- Negate(`%in%`)
-
 ```
 
 Template file. Code will be included in folded blocks in the output to facilitate grading. Please knit this file and commit both the rmd and the html output. If you add external files to your analysis, please commit them to the files folder in this repository. NOTE: please do not commit large (15MB+) files to GitHub. Instead please denote the origin of the files in your code. 
 
 ```{r data}
+# Database provided by teacher
 con <- DBI::dbConnect(RSQLite::SQLite(), here::here("database", "detroit.sqlite"))
 
 # DBI::dbListTables(con) # assessments, blight, foreclosures, parcels, parcels_historic, sales
@@ -183,10 +183,11 @@ sales_clean <- sales %>%
     across(c(grantor, grantee, sale_terms, ecf, property_c), as.factor),
     parcel_num = str_remove(parcel_num, "\\.$"),
     sale_date = lubridate::as_date(sale_date),
-    maybe_not_armslength = ifelse(sale_price == 0, 1, 0) %>% as.logical(),
+    maybe_not_armslength = ifelse(sale_price %in% c(0, 1), T, F),
     sale_price = as.numeric(sale_price),
     sale_price_r = round(sale_price, digits = -2),
-    sale_lessthan_10k = ifelse(sale_price < 10000, T, F)
+    sale_lessthan_10k = ifelse(sale_price < 10000, T, F),
+    sale_year = year(sale_date)
   )
 
 sales_clean %>%
@@ -298,7 +299,6 @@ Assessments is a very large datset at `r nrow(assessments)` rows. Working with t
 ```{r eda assessments}
 assessments_clean <- assessments %>%
   mutate(
-    year = as.factor(year),
     PARCELNO = str_remove(PARCELNO, "\\.$")
   )
 
@@ -316,9 +316,40 @@ Transforming the dollar values will be necessary in most places. It looks like t
 
 Use cmfproperty to conduct a sales ratio study across the relevant time period. Note that cmfproperty is designed to produce Rmarkdown reports but use the documentation and insert relevant graphs/figures into your report. Look to make this reproducible since you’ll need these methods to analyze your assessment model later on. Detroit has many sales which are not arm’s length (sold at fair market value) so some sales should be excluded, but which ones?
 
-```{r sales ratio study}
+The `cmfproperty` pacakge requires a dataframe with the parcel ID, sale year, sale price, and assessed value. Based on section A I'll be performing a sales ratio study across 2015 - 2019. 2020 is excluded because it doesn't have as much sales data as previous years, and pandemic effects are something I don't want to account for.
 
+```{r sales ratio study 1}
+sales_study <- sales_clean %>%
+  select(parcel_num, sale_year, sale_price) %>%
+  filter(sale_year %in% c(2015:2019)) %>%
+  distinct(parcel_num, .keep_all = T) %>%
+  filter(sale_price > 2500) # Ripping this cutoff from the package documentation for now
+
+study_data <- sales_study %>%
+  left_join(assessments_clean %>% 
+              select(PARCELNO, year, ASSESSEDVALUE), by = c("parcel_num" = "PARCELNO", "sale_year" = "year"))
 ```
+
+Now that the study data is created, I'll calculate sales ratios and generate some diagnostic plots.
+
+```{r sales ratio study 2}
+ratios <- cmfproperty::reformat_data(
+  data = study_data,
+  sale_col = "sale_price",
+  assessment_col = "ASSESSEDVALUE",
+  sale_year_col = "sale_year"
+)
+
+head(ratios)
+
+stats <- cmfproperty::calc_iaao_stats(ratios)
+head(stats)
+
+output <- diagnostic_plots(stats, ratios, min_reporting_yr = 2015, max_reporting_yr = 2019)
+output[[1]]
+```
+
+It looks like the number of arms length sales has been decreasing over the study period. `cmfproperty` has its own method for determining these sales, but I also utilized a cutoff of $2,500 while preprocessing the data based on the documentation for the package. This is an arbitrary decision, and I could use some other variables in the provided data to help in this process such as the ECF variable in the sales data.
 
 ## Section C 
 
