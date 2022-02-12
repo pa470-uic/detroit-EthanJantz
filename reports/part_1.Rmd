@@ -1,6 +1,6 @@
 ---
-title: "Part 1"
-author: "YOUR NAME"
+title: "Detroit Part 1"
+author: "Ethan"
 output: 
   html_document:
     code_folding: hide
@@ -9,8 +9,9 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
 library(cmfproperty)
+library(tidymodels)
 library(tidyverse)
 library(lubridate)
 
@@ -190,6 +191,7 @@ sales_clean <- sales %>%
     sale_year = year(sale_date)
   )
 
+# Arms length
 sales_clean %>%
   count(maybe_not_armslength) %>%
   mutate(prop = n / sum(n))
@@ -201,21 +203,25 @@ sales_clean %>%
   ggplot(aes(x = sale_year, y = parcels_sold)) +
   geom_col()
 
+# Sellers
 sales_clean %>%
   count(grantor) %>%
   mutate(prop = n / sum(n)) %>%
   arrange(desc(n))
 
+# Buyers
 sales_clean %>%
   count(grantee) %>%
   mutate(prop = n / sum(n)) %>%
   arrange(desc(n))
 
+# Terms
 sales_clean %>%
   count(sale_terms) %>%
   mutate(prop = n / sum(n)) %>%
   arrange(desc(n))
 
+# Sale Price
 sales_clean %>%
   count(sale_price) %>%
   mutate(prop = n / sum(n)) %>%
@@ -273,17 +279,25 @@ blight_clean %>%
   count(year = violation_year_bin) %>%
   mutate(prop = n / sum(n))
 
-blight_clean %>%
-  count(hour = hour(ticket_issued_time))
+# Hour of ticket issuance
+# blight_clean %>%
+#   count(hour = hour(ticket_issued_time))
 
+# Type of violation
 blight_clean %>%
   count(violation_description) %>%
   mutate(prop = n / sum(n)) %>%
   arrange(desc(n))
 
-blight_clean %>%
-  count(agency_name) %>%
-  mutate(prop = n / sum(n))
+# Agency issuing
+# blight_clean %>%
+#   count(agency_name) %>%
+#   mutate(prop = n / sum(n))
+
+# Create violations table by parcel
+blight_sum <- blight_clean %>%
+  count(parcelno) %>%
+  rename("violations" = n)
 ```
 
 There were a small chunk of violations in this data that were recorded as happening  on dates that haven't happened yet. I removed those. Most violations took place prior to 2011 or after 2015. This probably has some relationship with the Great Recession around 2008. 
@@ -339,7 +353,6 @@ ratios <- cmfproperty::reformat_data(
   assessment_col = "ASSESSEDVALUE",
   sale_year_col = "sale_year"
 )
-
 head(ratios)
 
 stats <- cmfproperty::calc_iaao_stats(ratios)
@@ -349,20 +362,63 @@ output <- diagnostic_plots(stats, ratios, min_reporting_yr = 2015, max_reporting
 output[[1]]
 ```
 
-It looks like the number of arms length sales has been decreasing over the study period. `cmfproperty` has its own method for determining these sales, but I also utilized a cutoff of $2,500 while preprocessing the data based on the documentation for the package. This is an arbitrary decision, and I could use some other variables in the provided data to help in this process such as the ECF variable in the sales data.
+It looks like the number of arms length sales has been decreasing over the study period. `cmfproperty` has its own method for determining whether a transaction was arms length using sales ratio quantiles; but I also utilized a cutoff of $2,500 while preprocessing the data based on the documentation for the package. I could use some other variables in the provided data to help in determine arms length sales such as the sale term variable in the sales data. If I remember correctly the Cook County Assessor's Office algorithm prefers using validated sales in testing.
 
 ## Section C 
 
 Explore trends and relationships with property sales using simple regressions
 
-```{r sales reg}
+```{r sales reg1}
+sales_reg <- sales_clean %>%
+  left_join(foreclosures_sum, by = c("parcel_num" = "prop_parcelnum")) %>%
+  filter(sale_terms == "VALID ARMS LENGTH")
 
+sales_lm <-  parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year), 
+      data = sales_reg)
+
+tidy(sales_lm)
 ```
+
+The point of this was to see the changes in the market on a given year in the study data. Sale year was coded as a factor because we want to see what the effect of any given year was knowing that the market effect of one year to the next may change. This is a common approach in econometrics. 
+
+```{r sales reg2}
+sales_lm <-  parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year) + property_c, 
+      data = sales_reg)
+
+tidy(sales_lm)
+```
+
+Improved residential properties were the base case in this model. Only 400-level properties are validated. I was unable to find descriptions of property classes that go above X60 in my research, but my guess is that the negative coefficients are associated with vacant properties as 402 is a vacant residential property class. 
 
 ## Section D
 
 Explore trends and relationships with foreclosures using simple regressions
 
-```{r foreclosure reg}
+```{r foreclosure reg1}
+fore_lm <- parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year):foreclosures, 
+      data = sales_reg)
 
+tidy(fore_lm)
 ```
+
+Here we can see that foreclosures (the majority of which happened before the study period available in sales data) had different impacts on different sale years. It's difficult to run an analysis on sale price alone with foreclosures, but let's see if we can explain houses with foreclosures. 
+
+```{r foreclosure reg2}
+sales_reg <- sales_reg %>%
+  left_join(blight_sum, by = c("parcel_num" = "parcelno"))
+
+fore_lm <- parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year):foreclosures + violations, 
+      data = sales_reg)
+
+tidy(fore_lm)
+```
+
+According to this model the number of violations on a property - the number of times the parcel number was found in the blight data - has a positive association with sale price. Could this be because the property was improved after being designated as blighted? I'm not sure. 
