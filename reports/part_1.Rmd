@@ -175,14 +175,18 @@ foreclosures_sum %>%
 
 ### Sales 
 
-To understand sales data it is important to understand terms. A grantor is the seller of the property and the grantee is the buyer. `ecf` stands for ["Economic Condition Factor"](https://www.michigan.gov/documents/treasury/Development_of_ECF_for_Public_Use_7-13_456527_7.pdf), which in Michigan is a state-based tool to adjust the assessment of the property to the local market. This variable seems important, as we can use it to identify qualitative aspects of sales, like whether it was a validated arms-length sale.
+A grantor is the seller of the property and the grantee is the buyer. `ecf` stands for ["Economic Condition Factor"](https://www.michigan.gov/documents/treasury/Development_of_ECF_for_Public_Use_7-13_456527_7.pdf), which in Michigan is a state-based tool to adjust the assessment of the property to the local market. This variable seems important, as we can use it to identify qualitative aspects of sales, like whether it was a validated arms-length sale.
 
 ```{r eda sales}
 sales_clean <- sales %>%
   mutate(
     across(c(grantor, grantee, sale_terms, ecf, property_c), as.factor),
+    parcel_num = str_remove(parcel_num, "\\.$"),
     sale_date = lubridate::as_date(sale_date),
-    maybe_not_armslength = ifelse(sale_price == 0, 1, 0) %>% as.logical()
+    maybe_not_armslength = ifelse(sale_price == 0, 1, 0) %>% as.logical(),
+    sale_price = as.numeric(sale_price),
+    sale_price_r = round(sale_price, digits = -2),
+    sale_lessthan_10k = ifelse(sale_price < 10000, T, F)
   )
 
 sales_clean %>%
@@ -210,9 +214,24 @@ sales_clean %>%
   count(sale_terms) %>%
   mutate(prop = n / sum(n)) %>%
   arrange(desc(n))
+
+sales_clean %>%
+  count(sale_price) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(prop))
+
+sales_clean %>%
+  filter(sale_price %in% c(0, 1)) %>%
+  count(year = year(sale_date)) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = year, y = n)) +
+  geom_col()
+  
 ```
 
 There's one imputed variable here: `maybe_not_armslength`, and it indicates a sale that I suspect wasn't an ["arms length"](https://www.investopedia.com/terms/a/armslength.asp) sale, or a property where the buyer and seller weren't approaching the sale in a way where both were aiming to get the best price for the property. One example of this would be an older adult selling the family home to a child for $0. For now I'm taking a crude approach and classifying only sales where the price was 0 as suspected non-arms length sales, but that will become a formula of some sort when it comes time to build a model.
+
+Two thirds of sales had a sale price of less than $10,000 and ~30% of sales were sold for either $0 or $1. 45% of sales for 0 or 1 dollars happened between 2014 and 2016. 
 
 The earliest sale in the sales data is from 2011 and the latest is from November 2020. We can likely pad this out with some data from the historical parcel data if historic sale data helps the model. The most sales happened in 2014, and the fewest happened in 2011 if we don't count 2020. It looks like the pandemic had a big effect on home sales in 2020 Detroit.
 
@@ -226,16 +245,93 @@ Property class definitions can be found [here](https://miproptaxlaw.com/wp-conte
 
 ### Blight
 
+```{r eda blight}
+blight_clean <- blight %>%
+  mutate(
+    across(c(agency_name, violator_name, city, state, zip_code, payment_status, violation_code),
+           as.factor),
+    across(c(violation_date, payment_date),
+           ~ str_extract(.x, "[0-9]{4}/[0-9]{2}/[0-9]{2}") %>% 
+             str_replace("/", "-") %>%
+             as_date()),
+    ticket_issued_time = str_remove(ticket_issued_time, "\\+[0-9]{2}$") %>%
+      str_remove("[0-9]{4}/[0-9]{2}/[0-9]{2} ") %>% 
+      hms(),
+    parcelno = str_remove(parcelno, "\\.$")
+  )
+
+blight_clean %>%
+  mutate(violation_year_bin = case_when(
+    year(violation_date) %in% c(1900:2010) ~ "Pre-2011",
+    year(violation_date) %in% c(2011:2015) ~ "2011-2015",
+    year(violation_date) %in% c(2016:2022) ~ "2016-2021",
+    TRUE ~ NA_character_
+    ) %>% as.factor()
+  ) %>%
+  filter(!is.na(violation_year_bin)) %>%
+  count(year = violation_year_bin) %>%
+  mutate(prop = n / sum(n))
+
+blight_clean %>%
+  count(hour = hour(ticket_issued_time))
+
+blight_clean %>%
+  count(violation_description) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+
+blight_clean %>%
+  count(agency_name) %>%
+  mutate(prop = n / sum(n))
+```
+
+There were a small chunk of violations in this data that were recorded as happening  on dates that haven't happened yet. I removed those. Most violations took place prior to 2011 or after 2015. This probably has some relationship with the Great Recession around 2008. 
+
+26% of violations were failure to obtain certificates of compliance. Other top violations were excessive weeds (12%), failure to register a rental property (11%), and allowing waste to accumulate or lie on premises (11%). I could do some text analysis here to pull out waste-related violations versus registration violations, there are a host of ways to split this out. I'm not sure that it will be useful to do so for now. 
+
+Most violations (57%) were issued by the department of Buildings, Safety Engineering & Environment, with the Detroit PD and BSEED Environmental Affairs following at 39% and 37% respectively. 
+
 ### Assessments
+
+Assessments is a very large datset at `r nrow(assessments)` rows. Working with this will be unwieldy without breaking the data out into chunks. I'll grab some general information for now, but I'm imagining that a model designed to predict the sale price of a home will only need to have the most recent assessed value for a property to do so. 
+
+```{r eda assessments}
+assessments_clean <- assessments %>%
+  mutate(
+    year = as.factor(year),
+    PARCELNO = str_remove(PARCELNO, "\\.$")
+  )
+
+assessments_clean %>%
+  pivot_longer(
+    cols = c(ASSESSEDVALUE, TAXABLEVALUE)
+  ) %>%
+  ggplot() +
+  geom_density(aes(x = log(value), fill = name), alpha = .5) 
+```
+
+Transforming the dollar values will be necessary in most places. It looks like the taxable value is frequently lower than the assessed value.
 
 ## Section B
 
 Use cmfproperty to conduct a sales ratio study across the relevant time period. Note that cmfproperty is designed to produce Rmarkdown reports but use the documentation and insert relevant graphs/figures into your report. Look to make this reproducible since you’ll need these methods to analyze your assessment model later on. Detroit has many sales which are not arm’s length (sold at fair market value) so some sales should be excluded, but which ones?
 
+```{r sales ratio study}
+
+```
+
 ## Section C 
 
 Explore trends and relationships with property sales using simple regressions
 
+```{r sales reg}
+
+```
+
 ## Section D
 
 Explore trends and relationships with foreclosures using simple regressions
+
+```{r foreclosure reg}
+
+```
