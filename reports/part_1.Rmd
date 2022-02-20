@@ -1,6 +1,6 @@
 ---
-title: "Part 1"
-author: "YOUR NAME"
+title: "Detroit Part 1"
+author: "Ethan"
 output: 
   html_document:
     code_folding: hide
@@ -9,32 +9,420 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+library(cmfproperty)
+library(tidymodels)
 library(tidyverse)
 library(lubridate)
 
+options(scipen = 999)
+
+`%nin%` <- Negate(`%in%`)
 ```
 
 Template file. Code will be included in folded blocks in the output to facilitate grading. Please knit this file and commit both the rmd and the html output. If you add external files to your analysis, please commit them to the files folder in this repository. NOTE: please do not commit large (15MB+) files to GitHub. Instead please denote the origin of the files in your code. 
 
-```{r}
-#example connection to database. note that you have to download the database from onedrive
+```{r data}
+# Database provided by teacher
+con <- DBI::dbConnect(RSQLite::SQLite(), here::here("database", "detroit.sqlite"))
 
-con <- DBI::dbConnect(RSQLite::SQLite(), "database/detroit.sqlite")
+# DBI::dbListTables(con) # assessments, blight, foreclosures, parcels, parcels_historic, sales
 
-# sales tbl
+sales <- tbl(con, 'sales') %>% collect()
 
-dplyr::tbl(con, 'sales')
+assessments <- tbl(con, 'assessments') %>% collect()
 
-# convert to tibble
-#dplyr::tbl(con, 'sales') %>% dplyr::collect()
+blight <- tbl(con, 'blight') %>% collect()
 
-# sql query
+foreclosures <- tbl(con, 'foreclosures') %>% collect()
 
-dplyr::tbl(con, 'sales') %>% count(year(sale_date))
+parcels <- tbl(con, 'parcels') %>% collect()
 
-#dplyr::tbl(con, 'sales') %>% count(year(sale_date)) %>% show_query()
-
+parcels_historic <- tbl(con, 'parcels_historic') %>% collect()
 ```
 
 
+## Section A
+
+Conduct an exploratory data analysis of homes in Detroit. Offer an overview of relevant trends in the data and data quality issues. Contextualize your analysis with key literature on properties in Detroit.
+
+There are several data sets within the database provided: `r DBI::dbListTables(con)`
+
+### Parcels and Historic Parcels
+
+Note: `parcel_number` is present across all data, and they all have trailing periods that seem out of place (except for the historic parcel data). I'm cleaning those out of the data and making transformations to benefit the ease of analysis and use as I go. If these periods are important please provide feedback to let me know!
+
+```{r eda parcels}
+parcels_clean <- parcels %>%
+  mutate(
+    across(c(parcel_number, related), ~str_remove(.x, "\\.$")),
+    sale_date = as_datetime(sale_date)
+    )
+
+# sum(parcels_historic$PARCELNO %in% parcels_clean$parcel_number) # 377,497 
+
+# unshared_parcels <- parcels_historic %>%
+#   filter(PARCELNO %nin% parcels_clean$parcel_number) %>%
+#   pull(PARCELNO)
+
+# Fleshing out whether each of the unshared has a partial match
+# tictoc::tic()
+# map_lgl(
+#   unshared_parcels[1:100], 
+#   ~ any(str_detect(parcels$parcel_number, str_extract(.x, "[0-9]*")))
+#   # filter(str_extract(.x, "[0-9]*") %>% 
+#     #          str_detect(parcel_number, .)) %>%
+#     # mutate(
+#     #   partial_parcel = .x, 
+#     #   partial_match = str_extract(.x, "[0-9]*")
+#     # )
+# ) # %>% sum() # 49 / 100 parcels are partial matches within the parcels data
+# tictoc::toc() # 10.64 seconds * 100 = 17.73 minutes, let's take this sample as a guess and assume that half of the unshared parcels have some match with the full data that we're missing
+```
+
+Of the `r nrow(parcels_historic)` historic parcels, `r sum(parcels_historic$PARCELNO %in% parcels_clean$parcel_number)` are found within the current parcels. The remaining `r nrow(parcels_historic) - sum(parcels_historic$PARCELNO %in% parcels_clean$parcel_number)` parcels in the historic data set make up a small portion of the total data. This is fixable, as you can see in the commented code above there are partial matches for about half of them based on my sampling method, but is not time efficient to match. If necessary I'll come back to this later. 
+
+```{r eda parcels 2}
+# Ward share
+parcels_clean %>%
+  count(ward, name = "parcels") %>%
+  filter(ward != " ") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Property class
+parcels_clean %>%
+  count(property_class_desc, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Vacancy
+parcels_clean %>%
+  mutate(vacant = str_detect(property_class_desc, "VACANT")) %>%
+  count(vacant, name = "parcels") %>%
+  drop_na() %>%
+  mutate(prop = scales::percent(parcels / sum(parcels)))
+
+# Improvements
+parcels_clean %>%
+  count(is_improved, name = "parcels") %>%
+  drop_na() %>%
+  mutate(prop = scales::percent(parcels / sum(parcels)))
+
+# Style
+parcels_clean %>%
+  count(style, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Missing style values
+parcels_clean %>%
+  filter(is.na(style)) %>%
+  mutate(vacant = str_detect(property_class_desc, "VACANT")) %>%
+  count(vacant, name = "parcels")
+
+# Tax status
+parcels_clean %>%
+  count(tax_status, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop))
+
+# Number of buildings on parcel
+parcels_clean %>%
+  mutate(num_bldgs = ifelse(num_bldgs %in% c(0, 1), num_bldgs, 2)) %>%
+  count(num_bldgs, name = "parcels") %>%
+  mutate(prop = parcels / sum(parcels)) %>%
+  arrange(desc(prop)) 
+```
+
+More than 50% of parcels are found within the 22nd, 21st, and 16th wards. The overwhelming majority of parcels are residential, and about 35% of all parcels are vacant. 62% of parcels have been improved. 50% of parcels are designated as single-family homes, and almost 40% of parcels have no "style" designation (likely because they're considered vacant). 70% of properties are taxable, and 21% are part of the city land bank. The city itself owns 2.1%, or 8,137 parcels. 60% of parcels contain one building, 37% contain zero buildings, and 1% of parcels contain 2 or more buildings. 
+
+```{r eda parcels 3}
+# Year of last sale
+parcels_clean %>%
+  mutate(sale_year = lubridate::floor_date(sale_date, unit = "year")) %>%
+  # drop_na(sale_year) %>%
+  count(sale_year, name = "parcels_sold") %>%
+  arrange(desc(parcels_sold))
+
+```
+
+Most sales in the parcels data happened around the Great Financial Crisis of 2008. We can explore how much of that sales acivity was foreclosures in a later part of this section. There are `r is.na(parcels_clean$sale_date) %>% sum()` parcels that have no sale date and `r (parcels_clean$sale_price == 0) %>% sum()` parcels that either did not sell or for some other reason sold for $0. 
+
+Is there some overlap between foreclosures, sales, and the information in the parcel data? 
+
+### Foreclosures
+
+```{r eda foreclosures}
+foreclosures_clean <- foreclosures %>%
+  mutate(prop_parcelnum = str_remove(prop_parcelnum, "\\.$"))
+
+foreclosures_clean %>%
+  filter(prop_parcelnum %in% parcels_clean$parcel_number)
+
+foreclosures_sum <- foreclosures_clean %>%
+  mutate(
+    across(where(is.numeric), ~ifelse(is.na(.x), 0, .x)),
+    foreclosures = rowSums(across(where(is.numeric)))
+    ) %>%
+  select(where(is.character), foreclosures)
+
+foreclosures_sum %>%
+  count(foreclosures) %>%
+  mutate(prop = n / sum(n))
+```
+
+`r foreclosures$prop_parcelnum %in% parcels$parcel_number %>% sum()` parcels in the foreclosure data are found within the parcel data, meaning that approximately 35% of parcels have been foreclosed on. Approximately 20% of the parcels in the foreclosure data has had more than one foreclosure since 2003. By joining this data with parcel data we can explore the spatial statistics of foreclosure in Detroit, but that isn't the focus of this project for now. 
+
+### Sales 
+
+A grantor is the seller of the property and the grantee is the buyer. `ecf` stands for ["Economic Condition Factor"](https://www.michigan.gov/documents/treasury/Development_of_ECF_for_Public_Use_7-13_456527_7.pdf), which in Michigan is a state-based tool to adjust the assessment of the property to the local market. This variable seems important, as we can use it to identify qualitative aspects of sales, like whether it was a validated arms-length sale.
+
+```{r eda sales}
+sales_clean <- sales %>%
+  mutate(
+    across(c(grantor, grantee, sale_terms, ecf, property_c), as.factor),
+    parcel_num = str_remove(parcel_num, "\\.$"),
+    sale_date = lubridate::as_date(sale_date),
+    maybe_not_armslength = ifelse(sale_price %in% c(0, 1), T, F),
+    sale_price = as.numeric(sale_price),
+    sale_price_r = round(sale_price, digits = -2),
+    sale_lessthan_10k = ifelse(sale_price < 10000, T, F),
+    sale_year = year(sale_date)
+  )
+
+# Arms length
+sales_clean %>%
+  count(maybe_not_armslength) %>%
+  mutate(prop = n / sum(n))
+
+sales_clean %>%
+  mutate(sale_year = lubridate::floor_date(sale_date, unit = "year")) %>%
+  # drop_na(sale_year) %>%
+  count(sale_year, name = "parcels_sold") %>%
+  ggplot(aes(x = sale_year, y = parcels_sold)) +
+  geom_col()
+
+# Sellers
+sales_clean %>%
+  count(grantor) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Buyers
+sales_clean %>%
+  count(grantee) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Terms
+sales_clean %>%
+  count(sale_terms) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Sale Price
+sales_clean %>%
+  count(sale_price) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(prop))
+
+sales_clean %>%
+  filter(sale_price %in% c(0, 1)) %>%
+  count(year = year(sale_date)) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = year, y = n)) +
+  geom_col()
+  
+```
+
+There's one imputed variable here: `maybe_not_armslength`, and it indicates a sale that I suspect wasn't an ["arms length"](https://www.investopedia.com/terms/a/armslength.asp) sale, or a property where the buyer and seller weren't approaching the sale in a way where both were aiming to get the best price for the property. One example of this would be an older adult selling the family home to a child for $0. For now I'm taking a crude approach and classifying only sales where the price was 0 as suspected non-arms length sales, but that will become a formula of some sort when it comes time to build a model.
+
+Two thirds of sales had a sale price of less than $10,000 and ~30% of sales were sold for either $0 or $1. 45% of sales for 0 or 1 dollars happened between 2014 and 2016. 
+
+The earliest sale in the sales data is from 2011 and the latest is from November 2020. We can likely pad this out with some data from the historical parcel data if historic sale data helps the model. The most sales happened in 2014, and the fewest happened in 2011 if we don't count 2020. It looks like the pandemic had a big effect on home sales in 2020 Detroit.
+
+The Wayne County Treasurer (11%) and Detroit Land Bank Authority (9%) were the most prevalent sellers of real estate in the sales data, with Fannie Mae coming in fourth behind the county sheriff. Yikes. The largest private grantor was Bank of America. Banks and LLCs make up a large portion of the sales data but we can see a number of individuals listed.
+
+The most prevalent buyer of real estate was the Detroit land Bank Authority (4%). It's worth noting that only public entities purchased more than 1% of all real estate sold in the data, with Hantz Woodlands LLC being the 6th largest purchaser of land at .05%. Hantz Woodlands LLC is an urban tree farm.
+
+35% of sales had no economic consideration. Almost 20% were exempt/government purchases. 16% of sales were validated as arms length sales. This isn't as many as I hoped, but we can ensure they are put in the training data. 
+
+Property class definitions can be found [here](https://miproptaxlaw.com/wp-content/uploads/2018/04/STCRecommendedClassificationCodes.pdf). This is already captured in the parcels data. It's not likely that changes in property classification are prevalent, but it may be worth looking into.
+
+### Blight
+
+```{r eda blight}
+blight_clean <- blight %>%
+  mutate(
+    across(c(agency_name, violator_name, city, state, zip_code, payment_status, violation_code),
+           as.factor),
+    across(c(violation_date, payment_date),
+           ~ str_extract(.x, "[0-9]{4}/[0-9]{2}/[0-9]{2}") %>% 
+             str_replace("/", "-") %>%
+             as_date()),
+    ticket_issued_time = str_remove(ticket_issued_time, "\\+[0-9]{2}$") %>%
+      str_remove("[0-9]{4}/[0-9]{2}/[0-9]{2} ") %>% 
+      hms(),
+    parcelno = str_remove(parcelno, "\\.$")
+  )
+
+blight_clean %>%
+  mutate(violation_year_bin = case_when(
+    year(violation_date) %in% c(1900:2010) ~ "Pre-2011",
+    year(violation_date) %in% c(2011:2015) ~ "2011-2015",
+    year(violation_date) %in% c(2016:2022) ~ "2016-2021",
+    TRUE ~ NA_character_
+    ) %>% as.factor()
+  ) %>%
+  filter(!is.na(violation_year_bin)) %>%
+  count(year = violation_year_bin) %>%
+  mutate(prop = n / sum(n))
+
+# Hour of ticket issuance
+# blight_clean %>%
+#   count(hour = hour(ticket_issued_time))
+
+# Type of violation
+blight_clean %>%
+  count(violation_description) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Agency issuing
+# blight_clean %>%
+#   count(agency_name) %>%
+#   mutate(prop = n / sum(n))
+
+# Create violations table by parcel
+blight_sum <- blight_clean %>%
+  count(parcelno) %>%
+  rename("violations" = n)
+```
+
+There were a small chunk of violations in this data that were recorded as happening  on dates that haven't happened yet. I removed those. Most violations took place prior to 2011 or after 2015. This probably has some relationship with the Great Recession around 2008. 
+
+26% of violations were failure to obtain certificates of compliance. Other top violations were excessive weeds (12%), failure to register a rental property (11%), and allowing waste to accumulate or lie on premises (11%). I could do some text analysis here to pull out waste-related violations versus registration violations, there are a host of ways to split this out. I'm not sure that it will be useful to do so for now. 
+
+Most violations (57%) were issued by the department of Buildings, Safety Engineering & Environment, with the Detroit PD and BSEED Environmental Affairs following at 39% and 37% respectively. 
+
+### Assessments
+
+Assessments is a very large datset at `r nrow(assessments)` rows. Working with this will be unwieldy without breaking the data out into chunks. I'll grab some general information for now, but I'm imagining that a model designed to predict the sale price of a home will only need to have the most recent assessed value for a property to do so. 
+
+```{r eda assessments}
+assessments_clean <- assessments %>%
+  mutate(
+    PARCELNO = str_remove(PARCELNO, "\\.$")
+  )
+
+assessments_clean %>%
+  pivot_longer(
+    cols = c(ASSESSEDVALUE, TAXABLEVALUE)
+  ) %>%
+  ggplot() +
+  geom_density(aes(x = log(value), fill = name), alpha = .5) 
+```
+
+Transforming the dollar values will be necessary in most places. It looks like the taxable value is frequently lower than the assessed value.
+
+## Section B
+
+Use cmfproperty to conduct a sales ratio study across the relevant time period. Note that cmfproperty is designed to produce Rmarkdown reports but use the documentation and insert relevant graphs/figures into your report. Look to make this reproducible since you’ll need these methods to analyze your assessment model later on. Detroit has many sales which are not arm’s length (sold at fair market value) so some sales should be excluded, but which ones?
+
+The `cmfproperty` pacakge requires a dataframe with the parcel ID, sale year, sale price, and assessed value. Based on section A I'll be performing a sales ratio study across 2015 - 2019. 2020 is excluded because it doesn't have as much sales data as previous years, and pandemic effects are something I don't want to account for.
+
+```{r sales ratio study 1}
+sales_study <- sales_clean %>%
+  select(parcel_num, sale_year, sale_price) %>%
+  filter(sale_year %in% c(2015:2019)) %>%
+  distinct(parcel_num, .keep_all = T) %>%
+  filter(sale_price > 2500) # Ripping this cutoff from the package documentation for now
+
+study_data <- sales_study %>%
+  left_join(assessments_clean %>% 
+              select(PARCELNO, year, ASSESSEDVALUE) %>%
+              filter(ASSESSEDVALUE > 1250), by = c("parcel_num" = "PARCELNO", "sale_year" = "year"))
+```
+
+Now that the study data is created, I'll calculate sales ratios and generate some diagnostic plots.
+
+```{r sales ratio study 2}
+ratios <- cmfproperty::reformat_data(
+  data = study_data,
+  sale_col = "sale_price",
+  assessment_col = "ASSESSEDVALUE",
+  sale_year_col = "sale_year"
+)
+# head(ratios)
+
+stats <- cmfproperty::calc_iaao_stats(ratios)
+head(stats)
+
+output <- diagnostic_plots(stats, ratios, min_reporting_yr = 2015, max_reporting_yr = 2019)
+output[[1]]
+```
+
+It looks like the number of arms length sales has been decreasing over the study period. `cmfproperty` has its own method for determining whether a transaction was arms length using sales ratio quantiles; but I also utilized a cutoff of $2,500 while preprocessing the data based on the documentation for the package. I could use some other variables in the provided data to help in determine arms length sales such as the sale term variable in the sales data. If I remember correctly the Cook County Assessor's Office algorithm prefers using validated sales in testing.
+
+## Section C 
+
+Explore trends and relationships with property sales using simple regressions
+
+```{r sales reg1}
+sales_reg <- sales_clean %>%
+  left_join(foreclosures_sum, by = c("parcel_num" = "prop_parcelnum")) %>%
+  filter(sale_terms == "VALID ARMS LENGTH")
+
+sales_lm <-  parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year), 
+      data = sales_reg)
+
+tidy(sales_lm)
+```
+
+The point of this was to see the changes in the market on a given year in the study data. Sale year was coded as a factor because we want to see what the effect of any given year was knowing that the market effect of one year to the next may change. This is a common approach in econometrics. 
+
+```{r sales reg2}
+sales_lm <-  parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year) + property_c, 
+      data = sales_reg)
+
+tidy(sales_lm)
+```
+
+Improved residential properties were the base case in this model. Only 400-level properties are validated. I was unable to find descriptions of property classes that go above X60 in my research, but my guess is that the negative coefficients are associated with vacant properties as 402 is a vacant residential property class. 
+
+## Section D
+
+Explore trends and relationships with foreclosures using simple regressions
+
+```{r foreclosure reg1}
+sales_reg <- sales_clean %>%
+  left_join(foreclosures_sum, by = c("parcel_num" = "prop_parcelnum")) 
+
+fore_lm <- parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year):foreclosures, 
+      data = sales_reg)
+
+tidy(fore_lm)
+```
+
+Here we can see that foreclosures (the majority of which happened before the study period available in sales data) had different impacts on different sale years. It's difficult to run an analysis on sale price alone with foreclosures, but let's see if we can explain houses with foreclosures. 
+
+```{r foreclosure reg2}
+sales_reg <- sales_reg %>%
+  left_join(blight_sum, by = c("parcel_num" = "parcelno"))
+
+fore_lm <- parsnip::linear_reg() %>%
+  set_engine("lm") %>%
+  fit(sale_price ~ as.factor(sale_year):foreclosures + violations, 
+      data = sales_reg)
+
+tidy(fore_lm)
+```
+
+According to this model the number of violations on a property - the number of times the parcel number was found in the blight data - has a positive association with sale price. Could this be because the property was improved after being designated as blighted? I'm not sure. 
