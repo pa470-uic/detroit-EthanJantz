@@ -341,7 +341,8 @@ sales_study <- sales_clean %>%
 
 study_data <- sales_study %>%
   left_join(assessments_clean %>% 
-              select(PARCELNO, year, ASSESSEDVALUE), by = c("parcel_num" = "PARCELNO", "sale_year" = "year"))
+              select(PARCELNO, year, ASSESSEDVALUE) %>%
+              filter(ASSESSEDVALUE > 1250), by = c("parcel_num" = "PARCELNO", "sale_year" = "year"))
 ```
 
 Now that the study data is created, I'll calculate sales ratios and generate some diagnostic plots.
@@ -353,7 +354,7 @@ ratios <- cmfproperty::reformat_data(
   assessment_col = "ASSESSEDVALUE",
   sale_year_col = "sale_year"
 )
-head(ratios)
+# head(ratios)
 
 stats <- cmfproperty::calc_iaao_stats(ratios)
 head(stats)
@@ -399,6 +400,9 @@ Improved residential properties were the base case in this model. Only 400-level
 Explore trends and relationships with foreclosures using simple regressions
 
 ```{r foreclosure reg1}
+sales_reg <- sales_clean %>%
+  left_join(foreclosures_sum, by = c("parcel_num" = "prop_parcelnum")) 
+
 fore_lm <- parsnip::linear_reg() %>%
   set_engine("lm") %>%
   fit(sale_price ~ as.factor(sale_year):foreclosures, 
