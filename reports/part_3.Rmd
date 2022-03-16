@@ -1,0 +1,275 @@
+---
+title: "Property Assessment in Detroit"
+author: "Ethan Jantz"
+date: "3/12/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+
+options(scipen = 999)
+
+`%nin%` <- Negate(`%in%`)
+
+# Database provided by teacher
+con <- DBI::dbConnect(RSQLite::SQLite(), here::here("database", "detroit.sqlite"))
+
+DBI::dbListTables(con) # assessments, blight, foreclosures, parcels, parcels_historic, sales
+
+sales <- tbl(con, 'sales') %>% 
+  collect() %>%
+  mutate(
+    across(c(grantor, grantee, sale_terms, ecf, property_c), as.factor),
+    # parcel_num = str_remove(parcel_num, "\\.$"),
+    sale_date = lubridate::as_date(sale_date),
+    maybe_not_armslength = ifelse(sale_price %in% c(0, 1), T, F),
+    sale_price = as.numeric(sale_price),
+    sale_price_r = round(sale_price, digits = -2),
+    sale_lessthan_10k = ifelse(sale_price < 10000, T, F),
+    sale_year = year(sale_date)
+  )
+
+assessments <- tbl(con, 'assessments') %>% 
+  collect() %>%
+  mutate(
+    # PARCELNO = str_remove(PARCELNO, "\\.$"),
+    year = as_date(paste(year, 1, 1, sep = "-"))
+  )
+
+blight <- tbl(con, 'blight') %>% 
+  collect() %>%
+  mutate(
+    across(c(agency_name, violator_name, city, state, zip_code, payment_status, violation_code),
+           as.factor),
+    across(c(violation_date, payment_date),
+           ~ str_extract(.x, "[0-9]{4}/[0-9]{2}/[0-9]{2}") %>% 
+             str_replace("/", "-") %>%
+             as_date()),
+    ticket_issued_time = str_remove(ticket_issued_time, "\\+[0-9]{2}$") %>%
+      str_remove("[0-9]{4}/[0-9]{2}/[0-9]{2} ") %>% 
+      hms()
+    # parcelno = str_remove(parcelno, "\\.$")
+  )
+
+foreclosures <- tbl(con, 'foreclosures') %>% 
+  collect() #%>%
+  # mutate(prop_parcelnum = str_remove(prop_parcelnum, "\\.$"))
+
+foreclosures_sum <- foreclosures %>%
+  mutate(
+    across(where(is.numeric), ~ifelse(is.na(.x), 0, .x)),
+    foreclosures = rowSums(across(where(is.numeric)))
+    ) %>%
+  select(where(is.character), foreclosures)
+
+parcels <- tbl(con, 'parcels') %>% 
+  collect() %>%
+  mutate(
+    # across(c(parcel_number, related), ~str_remove(.x, "\\.$")),
+    sale_date = as_datetime(sale_date),
+    sale_year = year(sale_date)
+    )
+
+parcels_historic <- tbl(con, 'parcels_historic') %>% collect()
+
+attributes <- tbl(con, 'attributes') %>% 
+  collect() %>%
+  mutate(
+    extcat = case_when(
+      extcat == 1 ~ "Siding",
+      extcat == 2 ~ "Brick/Other",
+      extcat == 3 ~ "Brick",
+      extcat == 4 ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    bathcat = case_when(
+      bathcat == 1 ~ "1",
+      bathcat == 2 ~ "1.5",
+      bathcat == 3 ~ "2-3",
+      bathcat == 4 ~ "4+",
+      TRUE ~ NA_character_
+    ),
+    heightcat = case_when(
+      heightcat == 1 ~ "1-1.5",
+      heightcat == 2 ~ "1.5-2.5",
+      heightcat == 3 ~ "3+",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Recreate sales ratio study from part 1
+sales_study <- sales %>%
+  select(parcel_num, sale_year, sale_price) %>%
+  filter(sale_year %in% c(2010:2019)) %>%
+  distinct(parcel_num, .keep_all = T) %>%
+  filter(sale_price > 2500)
+
+study_data <- sales_study %>%
+  left_join(assessments %>% 
+              select(PARCELNO, year, ASSESSEDVALUE) %>%
+              mutate(year = year(year)) %>%
+              filter(ASSESSEDVALUE > 1250),
+            by = c("parcel_num" = "PARCELNO", "sale_year" = "year"))
+
+ratios <- cmfproperty::reformat_data(
+  data = study_data,
+  sale_col = "sale_price",
+  assessment_col = "ASSESSEDVALUE",
+  sale_year_col = "sale_year"
+)
+
+stats <- cmfproperty::calc_iaao_stats(ratios)
+
+output <- cmfproperty::diagnostic_plots(stats, ratios, min_reporting_yr = 2010, max_reporting_yr = 2019)
+```
+
+# Introduction
+
+Detroit's residential property stock has been in decline since 2014, which is around the time that home sales fell to their lowest point in the 2010's. This decline in single family housing stock began when Detroit's housing market saw the largest wave of foreclosures it had seen in decades. Meanwhile, home sales have continued on an upward trend since at least 2011.
+
+```{r plot 1}
+properties <- assessments %>%
+  count(year) %>%
+  filter(year < as_date("2022-01-01"))
+
+homes <- assessments %>% 
+  filter(propclass == 401) %>%
+  count(year) %>%
+  filter(year < as_date("2022-01-01"))
+
+ggplot(data = NULL, aes(x = year, y = n)) +
+  geom_line(data = properties, color = "black", size = 1, alpha = .5) +
+  geom_point(data = properties, color = "black", alpha = .5) +
+  geom_line(data = homes, color = "blue", size = 1, alpha = .5) +
+  geom_point(data = homes, color = "blue", alpha = .5) +
+  scale_x_date(date_labels = "%Y", date_breaks = "2 year") +
+  scale_y_continuous(labels = scales::comma,
+                     limits = c(0, 355000)) +
+  labs(title = "While the number of properties in Detroit has increased\nthe number of single-family homes (blue) has dropped by a third",
+       x = "Year", y = "Properties") +
+  theme_minimal()
+```
+
+```{r plot 2}
+sales %>%
+  count(sale_year) %>%
+  filter(sale_year < 2020) %>%
+  ggplot(aes(x = sale_year, y = n)) +
+  geom_col() +
+  scale_x_continuous(breaks = c(2011:2019)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Year", y = "Homes Sold",
+       title = "Home sales have been increasing in volume since 2011") +
+  theme_minimal()
+```
+
+```{r plot 3}
+foreclosures %>%
+  pivot_longer(
+    cols = c(`2002`:`2019`),
+    names_to = "year"
+  ) %>%
+  group_by(year) %>%
+  summarize(foreclosures = sum(value, na.rm = T)) %>%
+  ggplot(aes(x = year, y = foreclosures)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Year", y = "Homes Sold",
+       title = "Foreclosures peaked in 2015") +
+  theme_minimal()
+```
+
+Detroit is the city with the highest poverty rate in the country. It has been [well documented](https://www.habitatbuilds.com/wp-content/uploads/2016/04/Benefits-of-Homeownership-Research-Summary.pdf) that homeownership is one of the many critical footholds for families to escape poverty, and property taxes can often make or break a family's ability to own a home. Knowing this, it is important for assessors offices to provide accurate assessments of properties so tax burdens are shared evenly across property owners and low-income households are not disproportionately burdened.
+
+The State of Michigan requires assessors to assess properties at 50% of their true, or market, value. Detroit's assessments have failed to meet this requirement, though they ave been improving since 2012. Most assessments since 2016 have been below 100% of the market value. 
+
+```{r plot 4}
+output[[3]] +
+  labs(title = "Assessment ratios have improved since 2012")
+```
+
+## Predicting Overassessments
+
+This report aims to build a better assessment model than the one that exists currently using machine learning techniques. Before attempting to predict the sale price of a given home, we will first build a model for predicting which homes have been overassessed, or assessed above 50% of its market value per Michigan law.
+
+
+```{r rf 0}
+model_data <- assessments %>%
+  left_join(
+    sales %>%
+      mutate(sale_year = as_date(sale_year)),
+    by = c("PARCELNO" = "parcel_num")
+)
+
+model_data <- model_data %>%
+  filter(year == "2016-01-01", year(sale_date) == 2016, property_c == "401",
+         sale_price > 2500, ASSESSEDVALUE > 1250) %>%
+  mutate(over = ifelse(ASSESSEDVALUE * 2 > sale_price, "Over", "Not") %>% 
+           as.factor())
+
+model_data <- model_data %>%
+  left_join(
+    parcels %>%
+      select(parcel_number, ward, zip_code, use_code_desc, total_square_footage, is_improved, style, year_built, zoning),
+    by = c("PARCELNO" = "parcel_number")
+  ) %>%
+  mutate(is_improved = ifelse(is_improved == 1, T, F)) %>%
+  filter(complete.cases(.)) # Removes ~700 rows
+```
+
+For this classification problem I will be using a random forest model. The recipe is going to convert NA values to unknown for zip code, style, and zoning values. Other than that I'm not going to mess with too much pre-processing on my first go.
+
+```{r rf 1}
+split <- initial_split(model_data)
+train <- training(split)
+test  <- testing(split)
+
+rf_mod <- 
+  rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_recipe <- recipe(over ~ sale_price + zip_code + is_improved + style + zoning,
+                    data = train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors())
+
+rf_workflow <- workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(rf_recipe)
+
+rf_fit <- fit(rf_workflow, train)
+
+rf_preds <- augment(rf_fit, train)
+```
+
+Let's create a classification matrix for this output using the `performanceEstimation` package that I found. fpr stands for false positive, fnr false negative, ppv predictive positive value, etc. 
+
+```{r rf 2}
+performanceEstimation::classificationMetrics(rf_preds$over, rf_preds$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) 
+```
+
+Not bad!
+
+```{r rf 3}
+rf_test <- augment(rf_fit, test)
+
+rf_test %>%
+  select(PARCELNO, over, .pred_class) %>%
+  count(over, .pred_class) %>%
+  mutate(pct = n / sum(n))
+
+performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) 
+```
+
+Still not bad, that's pretty cool!
+
+```{r rf 4}
+roc <- yardstick::roc_curve(data = rf_test, truth = over, .pred_Not)
+
+plot(roc)
+```
