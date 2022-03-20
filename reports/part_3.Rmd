@@ -10,6 +10,7 @@ knitr::opts_chunk$set(warning = FALSE)
 library(tidymodels)
 library(tidyverse)
 library(lubridate)
+library(leaflet)
 
 options(scipen = 999)
 
@@ -196,35 +197,64 @@ output[[3]] +
 
 This report aims to build a better assessment model than the one that exists currently using machine learning techniques. Before attempting to predict the sale price of a given home, we will first build a model for predicting which homes have been overassessed, or assessed above 50% of its market value per Michigan law.
 
+This model was created in the previous iteration of the assignment, and this iteration will include foreclosures as a predictor. This random forest model predicts over-assessments using the sale price, ZIP code, whether or not the property had been improved, the type of property (single family, two-flat, etc), the zoning code the property falls under, the percentage of population that identified as Black/African-American in 2019 according to the American Community Survey, and the number of times the property had been foreclosed. The model uses properties assessed in 2016.
+
+The modeling data removes properties that sold for less than 2500 or were assessed at less than 1250 to remove as many sales that were not arms-length sales as possible. 
 
 ```{r rf 0}
+rm(sales_study)
+rm(study_data)
+
 model_data <- assessments %>%
   left_join(
-    sales %>%
-      mutate(sale_year = as_date(sale_year)),
+    sales,
     by = c("PARCELNO" = "parcel_num")
-)
+) %>%
+  # Introducing new predictors
+  left_join(
+    foreclosures_sum,
+    by = c("PARCELNO" = "prop_parcelnum")
+  )
 
 model_data <- model_data %>%
-  filter(year == "2016-01-01", year(sale_date) == 2016, property_c == "401",
-         sale_price > 2500, ASSESSEDVALUE > 1250) %>%
-  mutate(over = ifelse(ASSESSEDVALUE * 2 > sale_price, "Over", "Not") %>% 
+  filter(year == "2016-01-01", 
+         property_c == "401",
+         sale_price > 2500,
+         ASSESSEDVALUE > 1250) %>%
+  mutate(over = ifelse(ASSESSEDVALUE > (sale_price / 2), 
+                       "Over", "Not") %>% 
            as.factor())
 
 model_data <- model_data %>%
   left_join(
     parcels %>%
-      select(parcel_number, ward, zip_code, use_code_desc, total_square_footage, is_improved, style, year_built, zoning),
+      select(parcel_number, ward, zip_code, use_code_desc, total_square_footage, is_improved, style, year_built, zoning, lon = X, lat = Y),
     by = c("PARCELNO" = "parcel_number")
   ) %>%
   mutate(is_improved = ifelse(is_improved == 1, T, F)) %>%
-  filter(complete.cases(.)) # Removes ~700 rows
+  filter(complete.cases(.))
+
+rf_model_data_sf <- model_data %>%
+  sf::st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  sf::st_join(
+    tidycensus::get_acs("tract",
+                        variables = c(pop = "B02001_001",
+                                      bpop = "B02001_003"),
+                        state = "MI",
+                        county = "Wayne",
+                        output = "wide",
+                        geometry = T) %>%
+      select(GEOID, pop = popE, bpop = bpopE) %>%
+      mutate(bpct = bpop / pop,
+             bpct = ifelse(is.nan(bpct), 0, bpct)) %>%
+      sf::st_transform(crs = 4326)
+  )
+
+rm(model_data)
 ```
 
-For this classification problem I will be using a random forest model. The recipe is going to convert NA values to unknown for zip code, style, and zoning values. Other than that I'm not going to mess with too much pre-processing on my first go.
-
 ```{r rf 1}
-split <- initial_split(model_data)
+split <- initial_split(rf_model_data_sf)
 train <- training(split)
 test  <- testing(split)
 
@@ -233,7 +263,161 @@ rf_mod <-
   set_engine("ranger") %>% 
   set_mode("classification")
 
-rf_recipe <- recipe(over ~ sale_price + zip_code + is_improved + style + zoning,
+rf_recipe <- recipe(over ~ sale_price + zip_code + is_improved + style + zoning + foreclosures + bpct, 
+                    data = train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors())
+
+rf_workflow <- workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(rf_recipe)
+
+rf_fit <- fit(rf_workflow, train)
+
+rf_preds <- augment(rf_fit, train)
+
+rm(split, rf_workflow, rf_recipe)
+```
+
+<!-- ```{r rf 2} -->
+<!-- performanceEstimation::classificationMetrics(rf_preds$over, rf_preds$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) -->
+<!-- ``` -->
+
+```{r rf 3}
+rf_test <- augment(rf_fit, test)
+
+rf_test %>%
+  select(PARCELNO, over, .pred_class) %>%
+  count(over, .pred_class) %>%
+  mutate(pct = n / sum(n))
+
+performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv"))
+```
+The following ROC plot shows that the model performs well in testing, predicting over 85% of cases correctly in the test data. The inclusion of demographic and foreclosure data did not significantly improve the model, though the model performs well both with and without the new data. The ROC plot below shows this performance, where sensitivity is the proportion of true positive cases and specificity is the proportion of true negative cases.
+
+```{r rf 4}
+roc <- yardstick::roc_curve(data = rf_test, truth = over, .pred_Not)
+
+autoplot(roc)
+```
+
+## Predicting Assessed Values
+
+This model uses the same modeling data process as the over-assessment predictor model with a minor change. The data used in assessment predictions is going to include data from 2016 until 2019. It trains on data from 2016 to 2018 and tests on data from 2019.
+
+```{r lm 0}
+model_data <- assessments %>%
+  left_join(
+    sales,
+    by = c("PARCELNO" = "parcel_num")
+) %>%
+  left_join(
+    foreclosures_sum,
+    by = c("PARCELNO" = "prop_parcelnum")
+  )
+
+model_data <- model_data %>%
+  filter(year(year) <= 2019, year(year) >= 2016, 
+         year(sale_date) %in% c(2016:2019),
+         property_c == "401",
+         sale_price > 2500,
+         ASSESSEDVALUE > 1250) %>%
+  mutate(over = ifelse(ASSESSEDVALUE > (sale_price / 2), 
+                       "Over", "Not") %>% 
+           as.factor())
+
+model_data <- model_data %>%
+  left_join(
+    parcels %>%
+      select(parcel_number, ward, zip_code, use_code_desc, total_square_footage, is_improved, style, year_built, zoning, lon = X, lat = Y),
+    by = c("PARCELNO" = "parcel_number")
+  ) %>%
+  mutate(is_improved = ifelse(is_improved == 1, T, F)) %>%
+  filter(complete.cases(.))
+
+lm_model_data_sf <- model_data %>%
+  sf::st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  sf::st_join(
+    tidycensus::get_acs("tract",
+                        variables = c(pop = "B02001_001",
+                                      bpop = "B02001_003"),
+                        state = "MI",
+                        county = "Wayne",
+                        output = "wide",
+                        geometry = T) %>%
+      select(GEOID, pop = popE, bpop = bpopE) %>%
+      mutate(bpct = bpop / pop,
+             bpct = ifelse(is.nan(bpct), 0, bpct)) %>%
+      sf::st_transform(crs = 4326)
+  ) %>%
+  arrange(year)
+
+rm(model_data)
+```
+
+```{r lm 1}
+split <- initial_time_split(lm_model_data_sf)
+train <- training(split)
+test  <- testing(split)
+
+lm_mod <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+lm_recipe <- recipe(ASSESSEDVALUE ~ sale_price + total_square_footage + 
+                      year_built + is_improved + style + foreclosures + bpct,
+                    data = train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors())
+
+lm_workflow <- workflow() %>%
+  add_model(lm_mod) %>%
+  add_recipe(lm_recipe)
+
+lm_fit <- fit(lm_workflow, train)
+
+lm_preds <- augment(lm_fit, train)
+
+rm(split, lm_workflow, lm_recipe)
+```
+
+```{r lm 2}
+bind_rows(
+  mape(lm_preds, truth = sale_price, estimate = .pred),
+  rmse(lm_preds, truth = sale_price, estimate = .pred)
+)
+```
+Before the introduction of new features, the model performed with an average of 72% off across all predictions, and an RMSE of $95,000. Now the model has an MAPE of 79% and an RMSE of $64,000.
+
+```{r lm 3}
+lm_preds <- augment(lm_fit, test %>% filter(year == "2019-01-01"))
+
+bind_rows(
+  mape(lm_preds, truth = sale_price, estimate = .pred),
+  rmse(lm_preds, truth = sale_price, estimate = .pred)
+)
+```
+
+## Generating Out of Sample Predictions
+
+This section will run the same models as above, but will focus on generating out of sample predictions. This means that, for the year being predicted, the models will predict for homes that did not sell. This will require minor changes to the model, such as replacing sale price (a value that won't exist for homes that didn't sell) with assessed values. 
+
+### Over-Assessments
+
+The over-assessment model trains on data where a sale was made in 2016 and tests on all homes that didn't sell that year. 
+
+```{r rf 1}
+train <- rf_model_data_sf %>%
+  filter(sale_year == 2016)
+test  <- rf_model_data_sf %>%
+  filter(sale_year != 2016)
+
+rf_mod <- 
+  rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_recipe <- recipe(over ~ sale_price + zip_code + is_improved + style + zoning + foreclosures + bpct, 
                     data = train) %>%
   step_novel(all_nominal_predictors()) %>%
   step_unknown(all_nominal_predictors())
@@ -247,29 +431,68 @@ rf_fit <- fit(rf_workflow, train)
 rf_preds <- augment(rf_fit, train)
 ```
 
-Let's create a classification matrix for this output using the `performanceEstimation` package that I found. fpr stands for false positive, fnr false negative, ppv predictive positive value, etc. 
-
-```{r rf 2}
-performanceEstimation::classificationMetrics(rf_preds$over, rf_preds$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) 
-```
-
-Not bad!
+This model performs as well at out of sample predictions as the previous version of the model, with a 91% positive predictive value rate. 
 
 ```{r rf 3}
 rf_test <- augment(rf_fit, test)
 
-rf_test %>%
-  select(PARCELNO, over, .pred_class) %>%
-  count(over, .pred_class) %>%
-  mutate(pct = n / sum(n))
+performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv"))
+```
+The following map shows the average true positive rate by census tract. 
 
-performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) 
+```{r map}
+tpr_sf <- rf_test %>%
+  select(GEOID, over, .pred_class) %>%
+  count(GEOID, over, .pred_class) %>%
+  group_by(GEOID) %>%
+  summarize(tpr = n / sum(n)) %>%
+  left_join(
+    tigris::tracts(state = "MI",
+                   county = "Wayne",
+                   cb = T) %>%
+      select(GEOID),
+    by = "GEOID"
+  ) %>%
+  ungroup() %>%
+  sf::st_as_sf()
+
+pal <- colorQuantile("YlOrRd", domain = tpr_sf$tpr)
+
+leaflet(tpr_sf) %>%
+  addPolygons(fillColor = ~pal(tpr),
+              color = "white",
+              weight = 2) %>%
+  addProviderTiles("CartoDB.Positron")
 ```
 
-Still not bad, that's pretty cool!
+And the following is a correlation plot of the relationship between the model's true positivity rate and the percentage of Black/African-American people living in the associated census tract. There does not seem to be a correlation between the two.
 
-```{r rf 4}
-roc <- yardstick::roc_curve(data = rf_test, truth = over, .pred_Not)
+```{r corrplot}
+df <- tpr_sf %>%
+  left_join(
+    tidycensus::get_acs("tract",
+                        variables = c(pop = "B02001_001",
+                                      bpop = "B02001_003"),
+                        state = "MI",
+                        county = "Wayne",
+                        output = "wide",
+                        geometry = F) %>%
+      select(GEOID, pop = popE, bpop = bpopE) %>%
+      mutate(bpct = bpop / pop,
+             bpct = ifelse(is.nan(bpct), 0, bpct)) 
+  ) %>%
+  sf::st_drop_geometry() %>%
+  select(tpr, bpct)
 
-plot(roc)
+df %>%
+  ggplot(aes(x = bpct, y = tpr)) +
+  geom_jitter() +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Correlation Plot",
+       subtitle = "Model True Positivity Rate and Percentage of Black/African-American\nPopulation in Corresponding Census Tract",
+       x = "Percent Black/African-American Population",
+       y = "True Positivity Rate")
 ```
+
+### Predicting Assessments
