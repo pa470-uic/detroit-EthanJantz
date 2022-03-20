@@ -2,17 +2,22 @@
 title: "Property Assessment in Detroit"
 author: "Ethan Jantz"
 date: "3/12/2022"
-output: html_document
+output: 
+  html_document:
+    code_folding: hide
+    df_print: paged
+    theme: sandstone
+
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, error = FALSE)
 library(tidymodels)
 library(tidyverse)
 library(lubridate)
 library(leaflet)
 
-options(scipen = 999)
+options(scipen = 999, tigris_use_cache = TRUE)
 
 `%nin%` <- Negate(`%in%`)
 
@@ -243,7 +248,8 @@ rf_model_data_sf <- model_data %>%
                         state = "MI",
                         county = "Wayne",
                         output = "wide",
-                        geometry = T) %>%
+                        geometry = T,
+                        progress = F) %>%
       select(GEOID, pop = popE, bpop = bpopE) %>%
       mutate(bpct = bpop / pop,
              bpct = ifelse(is.nan(bpct), 0, bpct)) %>%
@@ -286,12 +292,14 @@ rm(split, rf_workflow, rf_recipe)
 ```{r rf 3}
 rf_test <- augment(rf_fit, test)
 
-rf_test %>%
-  select(PARCELNO, over, .pred_class) %>%
-  count(over, .pred_class) %>%
-  mutate(pct = n / sum(n))
+# rf_test %>%
+#   select(PARCELNO, over, .pred_class) %>%
+#   count(over, .pred_class) %>%
+#   mutate(pct = n / sum(n))
 
-performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv"))
+performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) %>% 
+  enframe() %>%
+  DT::datatable()
 ```
 The following ROC plot shows that the model performs well in testing, predicting over 85% of cases correctly in the test data. The inclusion of demographic and foreclosure data did not significantly improve the model, though the model performs well both with and without the new data. The ROC plot below shows this performance, where sensitivity is the proportion of true positive cases and specificity is the proportion of true negative cases.
 
@@ -385,7 +393,8 @@ rm(split, lm_workflow, lm_recipe)
 bind_rows(
   mape(lm_preds, truth = sale_price, estimate = .pred),
   rmse(lm_preds, truth = sale_price, estimate = .pred)
-)
+) %>%
+  DT::datatable()
 ```
 Before the introduction of new features, the model performed with an average of 72% off across all predictions, and an RMSE of $95,000. Now the model has an MAPE of 79% and an RMSE of $64,000.
 
@@ -395,7 +404,8 @@ lm_preds <- augment(lm_fit, test %>% filter(year == "2019-01-01"))
 bind_rows(
   mape(lm_preds, truth = sale_price, estimate = .pred),
   rmse(lm_preds, truth = sale_price, estimate = .pred)
-)
+) %>%
+  DT::datatable()
 ```
 
 ## Generating Out of Sample Predictions
@@ -406,7 +416,7 @@ This section will run the same models as above, but will focus on generating out
 
 The over-assessment model trains on data where a sale was made in 2016 and tests on all homes that didn't sell that year. 
 
-```{r rf 1}
+```{r rf 5}
 train <- rf_model_data_sf %>%
   filter(sale_year == 2016)
 test  <- rf_model_data_sf %>%
@@ -433,10 +443,12 @@ rf_preds <- augment(rf_fit, train)
 
 This model performs as well at out of sample predictions as the previous version of the model, with a 91% positive predictive value rate. 
 
-```{r rf 3}
+```{r rf 6}
 rf_test <- augment(rf_fit, test)
 
-performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv"))
+performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) %>% 
+  enframe() %>%
+  DT::datatable()
 ```
 The following map shows the average true positive rate by census tract. 
 
@@ -496,3 +508,48 @@ df %>%
 ```
 
 ### Predicting Assessments
+
+This model trains on properties that sold in 2019 and tests on those that didn't.
+
+```{r lm 4}
+train <- lm_model_data_sf %>%
+  filter(sale_year == 2019)
+test <- lm_model_data_sf %>%
+  filter(sale_year != 2019)
+
+lm_mod <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+lm_recipe <- recipe(ASSESSEDVALUE ~ sale_price + total_square_footage + 
+                      year_built + is_improved + style + foreclosures + bpct,
+                    data = train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors())
+
+lm_workflow <- workflow() %>%
+  add_model(lm_mod) %>%
+  add_recipe(lm_recipe)
+
+lm_fit <- fit(lm_workflow, train)
+
+lm_preds <- augment(lm_fit, train)
+
+rm(split, lm_workflow, lm_recipe)
+```
+
+```{r lm 5}
+bind_rows(
+  mape(lm_preds, truth = sale_price, estimate = .pred),
+  rmse(lm_preds, truth = sale_price, estimate = .pred)
+) %>%
+  DT::datatable()
+```
+
+The following is a table of coefficients for our linear regression model. This shows the impact that each of the variables in our formula had on the final assessment of a property. The factors with the largest impact on assessed value were the style of the home and the percentage of Black/African-American population within the home's census tract. Both had positive coefficients.
+
+```{r lm 6}
+lm_fit %>%
+  tidy() %>%
+  DT::datatable()
+```
