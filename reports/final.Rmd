@@ -1,0 +1,402 @@
+---
+title: "Property Assessment in Detroit"
+author: "Ethan Jantz"
+date: "3/31/2022"
+output: 
+  html_document:
+    code_folding: hide
+    df_print: paged
+    theme: sandstone
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, error = FALSE)
+library(baguette)
+library(rules)
+library(xgboost)
+library(Cubist)
+library(glmnet)
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+library(leaflet)
+
+options(scipen = 999, tigris_use_cache = TRUE)
+
+`%nin%` <- Negate(`%in%`)
+
+# This check is used to reduce the amount of time spent computing over the course of this project
+# Running this RMD for the first time could take 1 - 3 hours depending on your system specifications.
+if(file.exists(here::here("database", "temp.Rds"))) {
+  load(here::here("database", "temp.Rds"))
+} else{
+  
+  # Database provided by teacher
+  con <- DBI::dbConnect(RSQLite::SQLite(), here::here("database", "detroit.sqlite"))
+  
+  DBI::dbListTables(con) # assessments, blight, foreclosures, parcels, parcels_historic, sales
+  
+  sales <- tbl(con, 'sales') %>% 
+    collect() %>%
+    mutate(
+      across(c(grantor, grantee, sale_terms, ecf, property_c), as.factor),
+      # parcel_num = str_remove(parcel_num, "\\.$"),
+      sale_date = lubridate::as_date(sale_date),
+      maybe_not_armslength = ifelse(sale_price %in% c(0, 1), T, F),
+      sale_price = as.numeric(sale_price),
+      sale_price_r = round(sale_price, digits = -2),
+      sale_lessthan_10k = ifelse(sale_price < 10000, T, F),
+      sale_year = year(sale_date)
+    )
+  
+  assessments <- tbl(con, 'assessments') %>% 
+    collect() %>%
+    mutate(
+      # PARCELNO = str_remove(PARCELNO, "\\.$"),
+      year = as_date(paste(year, 1, 1, sep = "-"))
+    )
+  
+  blight <- tbl(con, 'blight') %>% 
+    collect() %>%
+    mutate(
+      across(c(agency_name, violator_name, city, state, zip_code, payment_status, violation_code),
+             as.factor),
+      across(c(violation_date, payment_date),
+             ~ str_extract(.x, "[0-9]{4}/[0-9]{2}/[0-9]{2}") %>% 
+               str_replace("/", "-") %>%
+               as_date()),
+      ticket_issued_time = str_remove(ticket_issued_time, "\\+[0-9]{2}$") %>%
+        str_remove("[0-9]{4}/[0-9]{2}/[0-9]{2} ") %>% 
+        hms()
+      # parcelno = str_remove(parcelno, "\\.$")
+    )
+  
+  foreclosures <- tbl(con, 'foreclosures') %>% 
+    collect() #%>%
+  # mutate(prop_parcelnum = str_remove(prop_parcelnum, "\\.$"))
+  
+  foreclosures_sum <- foreclosures %>%
+    mutate(
+      across(where(is.numeric), ~ifelse(is.na(.x), 0, .x)),
+      foreclosures = rowSums(across(where(is.numeric)))
+    ) %>%
+    select(where(is.character), foreclosures)
+  
+  parcels <- tbl(con, 'parcels') %>% 
+    collect() %>%
+    mutate(
+      # across(c(parcel_number, related), ~str_remove(.x, "\\.$")),
+      sale_date = as_datetime(sale_date),
+      sale_year = year(sale_date)
+    )
+  
+  parcels_historic <- tbl(con, 'parcels_historic') %>% collect()
+  
+  attributes <- tbl(con, 'attributes') %>% 
+    collect() %>%
+    mutate(
+      extcat = case_when(
+        extcat == 1 ~ "Siding",
+        extcat == 2 ~ "Brick/Other",
+        extcat == 3 ~ "Brick",
+        extcat == 4 ~ "Other",
+        TRUE ~ NA_character_
+      ),
+      bathcat = case_when(
+        bathcat == 1 ~ "1",
+        bathcat == 2 ~ "1.5",
+        bathcat == 3 ~ "2-3",
+        bathcat == 4 ~ "4+",
+        TRUE ~ NA_character_
+      ),
+      heightcat = case_when(
+        heightcat == 1 ~ "1-1.5",
+        heightcat == 2 ~ "1.5-2.5",
+        heightcat == 3 ~ "3+",
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # Recreate sales ratio study from part 1
+  sales_study <- sales %>%
+    select(parcel_num, sale_year, sale_price) %>%
+    filter(sale_year %in% c(2010:2019)) %>%
+    distinct(parcel_num, .keep_all = T) %>%
+    filter(sale_price > 2500)
+  
+  study_data <- sales_study %>%
+    left_join(assessments %>% 
+                select(PARCELNO, year, ASSESSEDVALUE) %>%
+                mutate(year = year(year)) %>%
+                filter(ASSESSEDVALUE > 1250),
+              by = c("parcel_num" = "PARCELNO", "sale_year" = "year"))
+  
+  ratios <- cmfproperty::reformat_data(
+    data = study_data,
+    sale_col = "sale_price",
+    assessment_col = "ASSESSEDVALUE",
+    sale_year_col = "sale_year"
+  )
+  
+  stats <- cmfproperty::calc_iaao_stats(ratios)
+  
+  output <- cmfproperty::diagnostic_plots(stats, ratios, min_reporting_yr = 2010, max_reporting_yr = 2019)
+}
+```
+
+# Introduction
+
+Detroit's residential property stock has been in decline since 2014, which is around the time that home sales fell to their lowest point in the 2010's. This decline in single family housing stock began when Detroit's housing market saw the largest wave of foreclosures it had seen in decades. Meanwhile, home sales have continued on an upward trend since at least 2011.
+
+Detroit is the city with the highest poverty rate in the country. [Existing research shows](https://www.habitatbuilds.com/wp-content/uploads/2016/04/Benefits-of-Homeownership-Research-Summary.pdf) that homeownership is one of the many critical footholds for families to escape poverty, and property taxes can often make or break a family's ability to own a home. Knowing this, it is important for assessors offices to provide accurate assessments of properties so tax burdens are shared evenly across property owners and low-income households are not disproportionately burdened. 
+
+The State of Michigan requires assessors to assess properties at 50% of their true, or market, value. Detroit's assessments have failed to meet this requirement, though they have been improving since 2012. Most assessments since 2016 have been below 100% of the market value. 
+
+```{r plot}
+output[[3]] +
+  labs(title = "Assessment ratios have improved since 2012")
+```
+
+# Improving Detroit Assessments with Machine Learning
+
+This section aims to develop a better assessment process than the Detroit Assessor's Office using machine learning (ML) methods. Due to time constraints I was unable to perform a thorough comparison of my predictions versus Detroit's assessments. The models I compared were a linear regression model, a boosted tree model, and a cubist model. The following chart compares the predictions of my cubist model (the best performing model of the group) against the actual assessments. 
+
+```{r preprocessing}
+if(file.exists(here::here("database", "temp.Rds"))) {
+  message("temp.Rds was loaded")
+} else {
+  model_data <- assessments %>%
+    left_join(
+      sales,
+      by = c("PARCELNO" = "parcel_num")
+    ) %>%
+    left_join(
+      foreclosures_sum,
+      by = c("PARCELNO" = "prop_parcelnum")
+    )
+  
+  model_data <- model_data %>%
+    filter(year(year) == 2019, 
+           year(sale_date) %in% c(2013:2018),
+           property_c == "401",
+           sale_price > 2500,
+           ASSESSEDVALUE > 1250) %>%
+    mutate(over = ifelse(ASSESSEDVALUE > (sale_price / 2), 
+                         "Over", "Not") %>% 
+             as.factor(),
+           assess_log = log(ASSESSEDVALUE))
+  
+  model_data <- model_data %>%
+    left_join(
+      parcels %>%
+        select(parcel_number, ward, zip_code, use_code_desc, total_square_footage, style, year_built, zoning, lon = X, lat = Y),
+      by = c("PARCELNO" = "parcel_number")
+    ) %>%
+    filter(if_any(c(lon, lat), ~!is.na(.)))
+  
+  model_data_sf <- model_data %>%
+    sf::st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+    sf::st_join(
+      tidycensus::get_acs("tract",
+                          variables = c(pop = "B02001_001",
+                                        bpop = "B02001_003"),
+                          state = "MI",
+                          county = "Wayne",
+                          output = "wide",
+                          geometry = T) %>%
+        select(GEOID, pop = popE, bpop = bpopE) %>%
+        mutate(bpct = bpop / pop,
+               bpct = ifelse(is.nan(bpct), 0, bpct)) %>%
+        sf::st_transform(crs = 4326)
+    ) %>%
+    arrange(year)
+  
+  rm(model_data, sales, parcels, parcels_historic, assessments, attributes, blight, sales_study, foreclosures, foreclosures_sum)
+}
+```
+
+```{r recipe and split}
+split <- initial_time_split(model_data_sf %>%
+                              sf::st_drop_geometry()) 
+train <- training(split) 
+test <- testing(split)
+
+folds <- 
+  vfold_cv(train, v = 3, repeats = 3)
+
+recipe_set <- recipe(ASSESSEDVALUE ~ total_square_footage + ward +
+                       year_built + foreclosures + bpct,
+                     data = train) %>% 
+  step_log(all_outcomes()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors())
+```
+
+```{r workflow set}
+linear_reg_spec <-
+  linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet")
+
+xgb_spec <-
+  boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+             min_n = tune(), sample_size = tune(), trees = 250) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+cubist_spec <-
+  cubist_rules(committees = 5, neighbors = tune()) %>%
+  set_engine("Cubist")
+
+wf_set <- workflow_set(
+  preproc = list(recipe = recipe_set),
+  models = list(lm = linear_reg_spec, 
+                xgb = xgb_spec,
+                cubist = cubist_spec)
+)
+```
+
+```{r grid search}
+if(file.exists(here::here("database", "temp.Rds"))) {
+  message("temp.Rds was loaded")
+  } else {
+    grid_ctrl <-
+      control_grid(
+        save_pred = FALSE,
+        save_workflow = FALSE
+      )
+    
+    # print(Sys.time())
+    grid_results <-
+      wf_set %>%
+      workflow_map(
+        seed = 1337,
+        resamples = folds,
+        grid = 5,
+        control = grid_ctrl,
+        verbose = TRUE
+      )
+  }
+
+```
+
+```{r exploring grid results}
+# grid_results %>%
+#   rank_results() # XGBoost has the highest rank, rmse = .324 & rsq = .61, it also has the lowest rank
+# I'm going to move forward with the cubist model
+
+best_results <- 
+  grid_results %>% 
+  extract_workflow_set_result("recipe_cubist") %>% 
+  select_best(metric = "rsq")
+
+best_results_fit <- 
+  grid_results %>% 
+  extract_workflow("recipe_cubist") %>% 
+  finalize_workflow(best_results) %>% 
+  last_fit(split = split)
+
+best_results_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = ASSESSEDVALUE, y = .pred)) +
+  geom_abline(color = "gray50", lty = 2) +
+  geom_point(alpha = 0.5) +
+  coord_obs_pred() +
+  labs(x = "observed", y = "predicted")
+```
+
+# Exploring Hyperparameters for Overassessment Classification
+
+This section aims to find optimal hyperparameters for the random forest model for classifying overassessments. 1943 trees and a minimum of 2 observations in a split were the hyperparameters that this process found optimized the area under the curve (AUC) metric of performance. The result is a ROC AUC of .963 and a positive predictive value of 86%. 
+
+```{r classification tuning}
+split <- initial_time_split(model_data_sf %>%
+                              mutate(foreclosures = ifelse(is.na(foreclosures), 0, foreclosures)) %>%
+                              sf::st_drop_geometry()) 
+train <- training(split) 
+test <- testing(split)
+
+folds <- 
+  vfold_cv(train, v = 3, repeats = 3)
+
+recipe_set <- recipe(over ~ sale_price + total_square_footage + ward + foreclosures + bpct,
+                     data = train) %>% 
+  step_log(sale_price) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) 
+
+
+rf_spec <- 
+  rand_forest(trees = tune(), min_n = tune()) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(recipe_set)
+
+# initial_vals <- cubist_wf %>%
+#   tune_grid(
+#     folds,
+#     grid = 1 
+#   )
+initial_vals <- 3
+
+ctrl <- control_bayes(verbose = TRUE)
+if(file.exists(here::here("database", "temp.Rds"))) {
+  message("Temp.Rds was loaded")
+} else {
+  print(Sys.time())
+  tictoc::tic()
+  your_search <- 
+    rf_wf %>%
+    tune_bayes(
+      resamples = folds,
+      initial = initial_vals, #note you may simply pass a number here e.g. 6 for a random search
+      iter = 2,
+      control = ctrl
+    )
+  tictoc::toc() 
+  save.image(here::here("database", "temp.Rds"))
+}
+
+# show_best(your_search)
+```
+
+```{r classification with tuning}
+invisible(gc())
+rf_spec <- 
+  rand_forest(trees = 1943, min_n = 2) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(recipe_set)
+
+rf_fit <- fit(rf_wf, train)
+
+rf_preds <- augment(rf_fit, train)
+
+rf_test <- augment(rf_fit, test)
+
+performanceEstimation::classificationMetrics(rf_test$over, rf_test$.pred_class, metrics = c("fpr", "fnr", "tpr", "tnr", "ppv")) %>% 
+  enframe()
+
+roc <- yardstick::roc_curve(data = rf_test, truth = over, .pred_Not)
+
+autoplot(roc)
+```
+
+# Conclusion
+
+Detroit's assessment process is opaque. There is no mention of technical details on how assessments are derived on the Detroit Assessor's website. Because of that it is difficult to identify the ways in which their process could be improved from a technical perspective. This issue highlights the strength of a replicable, open sourced machine learning model over the current approach. While I did not have time to do a thorough comparison of my model's predictions against Detroit's assessments, this assignment provided plenty of time to reflect on the assessment process and how it can be improved from both a technical and governance perspective. The current system of taxation is deeply flawed, and property taxation is a subset of that system. Simple steps toward transparency would go a long way in addressing flaws in existing property tax systems; allowing for more questions to be answered as to whether this system is worth keeping in the first place and what a new system could look like.
+
+The process for choosing my assessment model was full of arbitrary decisions. Some of them were made to save time (I estimate that I spent about 10 hours on this document alone, not to mention the time spent on previous parts of this project) while others were made because a decision needed to be made and so I took my best shot at making an educated guess. The linear and boost tree models were provided on recommendation from Eric. My grid search ended up placing my boost tree model as both the highest and lowest performing model out of all tests. The model that I chose myself, the Cubist model, performed the best on average across all three models tested. So I decided to move forward with it despite it not having the highest ranked results. 
+
+The way a [Cubist model](https://topepo.github.io/Cubist/articles/cubist.html) works is interesting. Without getting too deep into specifics, it uses a mix of decision tree, nearest neighbor, and regression approaches to come to a prediction. The parameters you can set are the number of 'committees', the number of 'rules', and the number of 'neighbors'. The committees are essentially a boosting method indicating the number of model trees to iterate over. The rules are comparable to the branches of a random forest model. The neighbors are comparable to a K-nearest neighbors parameter setting.
+
+For my classification model I realized that I was running out of time and did my best to build a useful model with what I had. I tuned the trees and minimum number of observations per split parameters, resulting in values of 1943 trees and a minimum of 2 observations per split. The model ultimately performed with a positive predictive value of 86% and an ROC AUC of .96. That's not bad, though I don't think this model would perform great for anything other than single family homes.
+
+Speaking of single family homes, my model data consisted of only single family homes. While that covers a great deal of the real property in Detroit it is far from 100% of it and is a major limitation in my model. The Cook County Assessor's Office splits their assessment models out between residential and commercial property, so I imagine something similar would be useful for performing assessments in Detroit. To answer the question of this assignment, whether or not Detroit should use my model, I think that it would be beneficial to use a model similar to mine and make it open source to promote transparency in Detroit's property taxation practices. I would not recommend this exact model for performing all assessments in Detroit because of limitations I described earlier. 
